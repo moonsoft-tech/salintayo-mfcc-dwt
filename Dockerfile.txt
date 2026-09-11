@@ -1,18 +1,14 @@
 FROM python:3.11-slim
 
-# System dependencies required by librosa / soundfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
-    gfortran \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Upgrade pip first
 RUN pip install --no-cache-dir --upgrade pip
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
