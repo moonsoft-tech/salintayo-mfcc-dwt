@@ -1,24 +1,24 @@
-# ── Build stage ────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
 # System dependencies required by librosa / soundfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
+    gfortran \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python dependencies first (layer cache)
+# Upgrade pip first
+RUN pip install --no-cache-dir --upgrade pip
+
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
 COPY main.py .
 
-# Railway injects PORT env variable — default to 8000 for local dev
 ENV PORT=8000
-
 EXPOSE 8000
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT}
