@@ -1,4 +1,4 @@
-# Build: 2026-09-12 13:02 UTC
+# Build: 2026-09-12 13:09 UTC
 """
 SalinTayo Pronunciation Scoring Server
 ---------------------------------------
@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 app.add_middleware(
@@ -112,8 +112,9 @@ DIALECT_TTS_SLOW = {
 class ScoreRequest(BaseModel):
     audio_base64: str
     reference_base64: str
-    word: str
-    dialect_code: str = "fil"  # NEW: dialect-aware scoring
+    word: str                   # target word (what they should say)
+    heard_word: str = ""        # what STT actually heard (from app)
+    dialect_code: str = "fil"   # dialect-aware scoring
 
 class ScoreResponse(BaseModel):
     score: float
@@ -280,7 +281,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -306,11 +307,23 @@ def score_pronunciation(body: ScoreRequest):
     # 4. Dialect-aware score
     score = distance_to_score_ph(dist, dialect)
 
-    # 5. Minimum floor — if the word was heard correctly by STT and DTW
-    #    distance is reasonable, don't score below 40.
-    #    Filipino learners saying the word correctly shouldn't score < 40.
-    if dist < 200:
-        score = max(score, 55.0)
+    # 5. Smart floor — only boost score when STT confirmed the right word
+    #    was heard AND the acoustic distance is reasonable.
+    #    Wrong word said = no floor = honest low acoustic score.
+    heard_clean  = (body.heard_word or '').strip().lower()
+    target_clean = (body.word or '').strip().lower()
+    word_correct = heard_clean and target_clean and (
+        heard_clean == target_clean or
+        heard_clean in target_clean or
+        target_clean in heard_clean
+    )
+    if word_correct and dist < 150:
+        score = max(score, 60.0)
+    elif not word_correct:
+        # Wrong word — cap score at 45 regardless of acoustic similarity
+        # (saying a different word that happens to sound similar shouldn't
+        # score high)
+        score = min(score, 45.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
