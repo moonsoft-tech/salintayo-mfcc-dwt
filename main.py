@@ -1,4 +1,4 @@
-# Build: 2026-09-13 02:38 UTC
+# Build: 2026-09-13 02:43 UTC
 """
 SalinTayo Pronunciation Scoring Server
 ---------------------------------------
@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.6.0",
+    version="2.8.0",
 )
 
 app.add_middleware(
@@ -154,31 +154,39 @@ def decode_audio(b64: str) -> np.ndarray:
     if len(y) == 0:
         raise HTTPException(status_code=422, detail="Audio is empty or silent.")
 
+    # Safety check — must have at least 0.1s of audio
+    min_samples = int(SAMPLE_RATE * 0.1)
+    if len(y) < min_samples:
+        logger.warning("Audio very short: %d samples (%.2fs)", len(y), len(y)/SAMPLE_RATE)
+        # Don't reject — pad with zeros so MFCC can still run
+        y = np.pad(y, (0, min_samples - len(y)))
+
     return y
 
 
 def preprocess_audio(y: np.ndarray) -> np.ndarray:
     """
     Preprocess audio for Philippine dialect phonology:
-    1. Trim silence (top_db=25 — Filipino speakers often have short pauses)
-    2. Pre-emphasis filter — boosts high frequencies, helps distinguish
-       Philippine consonants (especially /t/, /d/, /n/, /ng/, /k/)
-    3. Normalize amplitude — removes recording volume differences between
-       phones (important: Filipino learners record on varied devices)
+    1. Trim silence — lenient threshold so short words aren't wiped out
+    2. Pre-emphasis filter — boosts consonants (/t/, /d/, /n/, /ng/, /k/)
+    3. Normalize amplitude — removes volume differences between devices
     """
-    # 1. Trim silence
-    y, _ = librosa.effects.trim(y, top_db=25)
+    # 1. Trim silence — top_db=40 is lenient enough to keep short Filipino
+    #    words intact. top_db=25 was too aggressive and wiped out gTTS audio.
+    trimmed, _ = librosa.effects.trim(y, top_db=40)
+    # Safety: if trim removed everything, use original audio
+    if len(trimmed) < 100:
+        trimmed = y
 
-    # 2. Pre-emphasis — standard for speech processing, especially helpful
-    #    for Philippine languages where final consonants are often soft
-    y = np.append(y[0], y[1:] - 0.97 * y[:-1])
+    # 2. Pre-emphasis
+    y_out = np.append(trimmed[0], trimmed[1:] - 0.97 * trimmed[:-1])
 
     # 3. Amplitude normalization
-    max_val = np.max(np.abs(y))
+    max_val = np.max(np.abs(y_out))
     if max_val > 0:
-        y = y / max_val
+        y_out = y_out / max_val
 
-    return y
+    return y_out
 
 
 def extract_mfcc_ph(y: np.ndarray) -> np.ndarray:
@@ -249,7 +257,7 @@ def distance_to_score_ph(distance: float, dialect_code: str) -> float:
 
     # Tight decay — penalizes distance quickly
     # dist=0  → 50 (perfect), dist=20 → ~20, dist=50 → ~5
-    raw = 50.0 * np.exp(-effective_distance / 80.0)
+    raw = 50.0 * np.exp(-effective_distance / 500.0)
     return float(np.clip(raw, 0.0, 50.0))
 
 
@@ -281,7 +289,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.6.0",
+        "version": "2.8.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -317,13 +325,13 @@ def score_pronunciation(body: ScoreRequest):
         heard_clean in target_clean or
         target_clean in heard_clean
     )
-    if word_correct and dist < 60:
-        score = max(score, 20.0)
+    if word_correct and dist < 350:
+        score = max(score, 30.0)
     elif not word_correct:
         # Wrong word — cap score at 45 regardless of acoustic similarity
         # (saying a different word that happens to sound similar shouldn't
         # score high)
-        score = min(score, 5.0)
+        score = min(score, 10.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
