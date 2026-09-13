@@ -1,4 +1,4 @@
-# Build: 2026-09-12 13:09 UTC
+# Build: 2026-09-13 02:31 UTC
 """
 SalinTayo Pronunciation Scoring Server
 ---------------------------------------
@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 app.add_middleware(
@@ -249,7 +249,7 @@ def distance_to_score_ph(distance: float, dialect_code: str) -> float:
     effective_distance = distance / tolerance
 
     # Sigmoid-like decay tuned for Philippine short word distribution
-    score = 100.0 * np.exp(-effective_distance / 200.0)
+    score = 100.0 * np.exp(-effective_distance / 150.0)
     return float(np.clip(score, 0.0, 100.0))
 
 
@@ -281,7 +281,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -317,13 +317,13 @@ def score_pronunciation(body: ScoreRequest):
         heard_clean in target_clean or
         target_clean in heard_clean
     )
-    if word_correct and dist < 150:
+    if word_correct and dist < 100:
         score = max(score, 60.0)
     elif not word_correct:
         # Wrong word — cap score at 45 regardless of acoustic similarity
         # (saying a different word that happens to sound similar shouldn't
         # score high)
-        score = min(score, 45.0)
+        score = min(score, 20.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
