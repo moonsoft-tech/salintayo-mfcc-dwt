@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.8.0",
+    version="2.9.0",
 )
 
 app.add_middleware(
@@ -239,30 +239,44 @@ def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
 
 def distance_to_score_ph(distance: float, dialect_code: str) -> float:
     """
-    Convert DTW distance to 0-50 score (max 50 = perfect native pronunciation).
-    Tuned for Philippine dialect learner expectations:
-      - Perfect pronunciation  → ~50%
-      - Close (pagkaon/pagkaen) → ~20%
-      - Wrong word / very far  → below 10% (capped separately)
+    Convert DTW distance to 0-100 score matching the app's four score tiers:
 
-    Max score is 50 (not 100) because the reference is gTTS (synthetic),
-    not a native speaker — even a perfect human pronunciation will differ
-    acoustically from robotic TTS. Capping at 50 makes the scale honest.
+      100        — acoustically very close (near-perfect, dist < 80)
+      50 – 99    — near: sounds close but not perfect   (dist 80–300)
+      20 – 49    — far: recognisably different           (dist 300–600)
+      0  – 19    — very wrong / different word           (dist > 600)
 
-    Dialect tolerance adjusts the curve — more divergent dialects get
-    more leniency since the TTS reference is always Filipino.
+    Why 100 is achievable:
+      The old cap of 50 existed because gTTS reference audio is synthetic —
+      a real speaker will never be acoustically identical to it. That's true,
+      but the cap made it impossible to score "perfect" even for excellent
+      pronunciation, which contradicts the user-facing tier system. Instead,
+      we treat dist < 80 (extremely close acoustic match) as 100%, and scale
+      linearly within each band for the rest. The floor/cap logic in the
+      route handler then adjusts based on what STT actually heard.
+
+    Dialect tolerance adjusts the effective distance — more divergent dialects
+    get more leniency since the gTTS reference is always standard Filipino.
     """
     tolerance = DIALECT_TOLERANCE.get(dialect_code, 1.0)
-    effective_distance = distance / tolerance
+    d = distance / tolerance  # effective distance after dialect leniency
 
-    # Tight decay — penalizes distance quickly
-    # dist=0  → 50 (perfect), dist=20 → ~20, dist=50 → ~5
-    raw = 50.0 * np.exp(-effective_distance / 500.0)
-    return float(np.clip(raw, 0.0, 50.0))
+    if d < 80:
+        # Perfect band: very tight acoustic match → 100
+        return 100.0
+    elif d < 300:
+        # Near band: dist 80 → 99, dist 300 → 50
+        return float(np.clip(99.0 - (d - 80.0) / 220.0 * 49.0, 50.0, 99.0))
+    elif d < 600:
+        # Far band: dist 300 → 49, dist 600 → 20
+        return float(np.clip(49.0 - (d - 300.0) / 300.0 * 29.0, 20.0, 49.0))
+    else:
+        # Very wrong band: dist 600 → 19, dist 1200+ → 0
+        return float(np.clip(19.0 - (d - 600.0) / 600.0 * 19.0, 0.0, 19.0))
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
-    """Feedback messages aware of Philippine dialect context."""
+    """Feedback messages matching the app's four score tiers."""
     dialect_names = {
         "fil": "Filipino", "ceb": "Cebuano", "hil": "Hiligaynon",
         "ilo": "Ilocano", "war": "Waray", "bik": "Bikol",
@@ -271,14 +285,12 @@ def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
     }
     dialect_name = dialect_names.get(dialect_code, "Filipino")
 
-    if score >= 85:
-        return f"Mahusay! Your {dialect_name} pronunciation of '{word}' is excellent."
-    elif score >= 70:
-        return f"Magaling! '{word}' sounds good — keep practicing the stress pattern."
+    if score == 100:
+        return f"Perfect pronunciation! Excellent work on '{word}'! 🎉"
     elif score >= 50:
-        return f"Mabuti! Try to stress the right syllable in '{word}' and match the vowel sounds."
-    elif score >= 30:
-        return f"Keep going! Focus on the vowel sounds in '{word}' — Filipino has only 5 pure vowels: a, e, i, o, u."
+        return f"Magaling! '{word}' sounds very close — a little more practice and you'll nail it. 👍"
+    elif score >= 20:
+        return f"Getting there! Focus on matching each syllable of '{word}' and the vowel sounds: a, e, i, o, u."
     else:
         return f"Subukan ulit! Listen to the reference for '{word}' carefully and try to match each syllable."
 
@@ -289,7 +301,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.8.0",
+        "version": "2.9.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
