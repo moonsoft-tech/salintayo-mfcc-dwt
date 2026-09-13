@@ -1,4 +1,4 @@
-# Build: 2026-09-13 03:24 UTC
+# Build: 2026-09-13 02:43 UTC
 """
 SalinTayo Pronunciation Scoring Server
 ---------------------------------------
@@ -29,8 +29,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastdtw import fastdtw
-import asyncio
-import edge_tts
+from gtts import gTTS
 from pydantic import BaseModel
 from scipy.spatial.distance import euclidean
 
@@ -40,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.0.0",
+    version="2.8.0",
 )
 
 app.add_middleware(
@@ -62,19 +61,17 @@ N_MFCC     = 10
 HOP_LENGTH = 256  # smaller = more frames = better for short CV words
 
 # ── Language mapping ───────────────────────────────────────────────────────────
-# Edge TTS neural voices — Microsoft neural voices, human-sounding
-# Filipino neural voices are trained on real native speaker data
-EDGE_TTS_VOICE_MAP = {
-    "fil": "fil-PH-BlessicaNeural",  # Filipino female — natural, clear
-    "ceb": "fil-PH-BlessicaNeural",  # Cebuano — use Filipino neural (closest)
-    "ilo": "fil-PH-BlessicaNeural",  # Ilocano
-    "hil": "fil-PH-BlessicaNeural",  # Hiligaynon
-    "war": "fil-PH-BlessicaNeural",  # Waray
-    "bik": "fil-PH-BlessicaNeural",  # Bikol
-    "pam": "fil-PH-BlessicaNeural",  # Kapampangan
-    "tsg": "fil-PH-BlessicaNeural",  # Tausug
-    "pag": "fil-PH-BlessicaNeural",  # Pangasinense
-    "en":  "en-US-AriaNeural",       # English — natural US neural voice
+GTTS_LANG_MAP = {
+    "fil": "tl",
+    "ceb": "tl",
+    "ilo": "tl",
+    "hil": "tl",
+    "war": "tl",
+    "bik": "tl",
+    "pam": "tl",
+    "tsg": "tl",
+    "pag": "tl",
+    "en":  "en",
 }
 
 # ── Dialect phonetic profiles ──────────────────────────────────────────────────
@@ -93,6 +90,22 @@ DIALECT_TOLERANCE = {
     "pam": 1.2,   # Kapampangan — /e/ and /i/ merger, /o/ and /u/ merger
     "tsg": 1.5,   # Tausug — Arabic-influenced phonology, most divergent
     "pag": 1.2,   # Pangasinense
+}
+
+# gTTS generates Filipino TTS which is a fair reference for all PH dialects
+# since they share core phonology. For dialect-specific TTS, slow=True
+# helps learners hear each syllable clearly.
+DIALECT_TTS_SLOW = {
+    "fil": True,   # slow for learners
+    "ceb": True,
+    "hil": True,
+    "ilo": True,
+    "war": True,
+    "bik": True,
+    "pam": True,
+    "tsg": True,
+    "pag": True,
+    "en":  False,  # English: normal speed sounds more natural
 }
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -159,7 +172,7 @@ def preprocess_audio(y: np.ndarray) -> np.ndarray:
     3. Normalize amplitude — removes volume differences between devices
     """
     # 1. Trim silence — top_db=40 is lenient enough to keep short Filipino
-    #    words intact. top_db=25 was too aggressive and wiped out short audio.
+    #    words intact. top_db=25 was too aggressive and wiped out gTTS audio.
     trimmed, _ = librosa.effects.trim(y, top_db=40)
     # Safety: if trim removed everything, use original audio
     if len(trimmed) < 100:
@@ -232,8 +245,9 @@ def distance_to_score_ph(distance: float, dialect_code: str) -> float:
       - Close (pagkaon/pagkaen) → ~20%
       - Wrong word / very far  → below 10% (capped separately)
 
-    Max score is 50 (not 100) — even with Edge TTS neural voice, there
-    is some acoustic gap between TTS and real human voice. Honest cap.
+    Max score is 50 (not 100) because the reference is gTTS (synthetic),
+    not a native speaker — even a perfect human pronunciation will differ
+    acoustically from robotic TTS. Capping at 50 makes the scale honest.
 
     Dialect tolerance adjusts the curve — more divergent dialects get
     more leniency since the TTS reference is always Filipino.
@@ -275,8 +289,8 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.0.0",
-        "dialect_support": list(EDGE_TTS_VOICE_MAP.keys()),
+        "version": "2.8.0",
+        "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
 
@@ -335,31 +349,17 @@ def score_pronunciation(body: ScoreRequest):
 
 @app.post("/reference/generate", response_model=ReferenceResponse)
 def generate_reference(body: ReferenceRequest):
-    voice = EDGE_TTS_VOICE_MAP.get(body.language_code, "fil-PH-BlessicaNeural")
-    logger.info("Generating reference for '%s' (voice=%s)", body.word, voice)
+    lang = GTTS_LANG_MAP.get(body.language_code, "tl")
+    slow = DIALECT_TTS_SLOW.get(body.language_code, True)
+    logger.info("Generating reference for '%s' (lang=%s, slow=%s)", body.word, lang, slow)
 
     try:
-        # Edge TTS is async — run it in a new event loop
-        async def synthesize() -> bytes:
-            buf = io.BytesIO()
-            communicate = edge_tts.Communicate(
-                text=body.word,
-                voice=voice,
-                rate="-20%",   # slightly slower for learners to hear clearly
-                volume="+0%",
-            )
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    buf.write(chunk["data"])
-            return buf.getvalue()
-
-        audio_bytes = asyncio.run(synthesize())
-        if not audio_bytes:
-            raise ValueError("Edge TTS returned empty audio")
-
-        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        tts = gTTS(text=body.word, lang=lang, slow=slow)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode("utf-8")
     except Exception as e:
-        logger.error("Edge TTS failed: %s", e)
         raise HTTPException(status_code=502, detail=f"TTS generation failed: {e}")
 
     return ReferenceResponse(reference_base64=b64, word=body.word)
