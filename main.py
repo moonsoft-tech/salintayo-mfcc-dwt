@@ -1,4 +1,4 @@
-# Build: 2026-09-13 02:31 UTC
+# Build: 2026-09-13 02:35 UTC
 """
 SalinTayo Pronunciation Scoring Server
 ---------------------------------------
@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.3.0",
+    version="2.5.0",
 )
 
 app.add_middleware(
@@ -231,26 +231,26 @@ def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
 
 def distance_to_score_ph(distance: float, dialect_code: str) -> float:
     """
-    Convert DTW distance to 0-100 score with dialect-specific tolerance.
+    Convert DTW distance to 0-50 score (max 50 = perfect native pronunciation).
+    Tuned for Philippine dialect learner expectations:
+      - Perfect pronunciation  → ~50%
+      - Close (pagkaon/pagkaen) → ~20%
+      - Wrong word / very far  → below 10% (capped separately)
 
-    Scoring curve tuned for Philippine learners:
-    - Native-like pronunciation (distance < 15): 85-100
-    - Good pronunciation (15-40): 65-85
-    - Acceptable (40-80): 40-65
-    - Needs work (80+): below 40
+    Max score is 50 (not 100) because the reference is gTTS (synthetic),
+    not a native speaker — even a perfect human pronunciation will differ
+    acoustically from robotic TTS. Capping at 50 makes the scale honest.
 
-    Dialect tolerance adjusts the curve — Tausug learners pronouncing
-    Tausug words get more tolerance than Filipino learners pronouncing
-    Filipino words, because the TTS reference is always Filipino.
+    Dialect tolerance adjusts the curve — more divergent dialects get
+    more leniency since the TTS reference is always Filipino.
     """
     tolerance = DIALECT_TOLERANCE.get(dialect_code, 1.0)
-    # Effective distance is reduced by tolerance — more lenient dialects
-    # effectively "see" a smaller distance for the same recording
     effective_distance = distance / tolerance
 
-    # Sigmoid-like decay tuned for Philippine short word distribution
-    score = 100.0 * np.exp(-effective_distance / 150.0)
-    return float(np.clip(score, 0.0, 100.0))
+    # Tight decay — penalizes distance quickly
+    # dist=0  → 50 (perfect), dist=20 → ~20, dist=50 → ~5
+    raw = 50.0 * np.exp(-effective_distance / 25.0)
+    return float(np.clip(raw, 0.0, 50.0))
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
@@ -281,7 +281,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.3.0",
+        "version": "2.5.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -317,13 +317,13 @@ def score_pronunciation(body: ScoreRequest):
         heard_clean in target_clean or
         target_clean in heard_clean
     )
-    if word_correct and dist < 100:
-        score = max(score, 60.0)
+    if word_correct and dist < 60:
+        score = max(score, 20.0)
     elif not word_correct:
         # Wrong word — cap score at 45 regardless of acoustic similarity
         # (saying a different word that happens to sound similar shouldn't
         # score high)
-        score = min(score, 20.0)
+        score = min(score, 5.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
