@@ -316,22 +316,38 @@ def score_pronunciation(body: ScoreRequest):
     score = distance_to_score_ph(dist, dialect)
 
     # 5. Smart floor — only boost score when STT confirmed the right word
-    #    was heard AND the acoustic distance is reasonable.
+    #    was heard AND the acoustic distance is tight.
     #    Wrong word said = no floor = honest low acoustic score.
+    #    Threshold tightened: word_correct requires very close string match
+    #    (not just substring) AND tight acoustic distance (< 200, not 350)
+    #    to prevent near-misses from getting an artificial score boost.
     heard_clean  = (body.heard_word or '').strip().lower()
     target_clean = (body.word or '').strip().lower()
-    word_correct = heard_clean and target_clean and (
-        heard_clean == target_clean or
-        heard_clean in target_clean or
-        target_clean in heard_clean
-    )
-    if word_correct and dist < 350:
-        score = max(score, 30.0)
+
+    # Strict match: exact, or one fully contains the other AND they share
+    # at least 80% of their characters — prevents "big" matching "Tubig".
+    def strict_word_match(heard: str, target: str) -> bool:
+        if not heard or not target:
+            return False
+        if heard == target:
+            return True
+        longer = max(len(heard), len(target))
+        shorter = min(len(heard), len(target))
+        # Must be at least 80% of the longer word's length to count
+        if shorter / longer < 0.8:
+            return False
+        return heard in target or target in heard
+
+    word_correct = strict_word_match(heard_clean, target_clean)
+
+    if word_correct and dist < 200:
+        # Tighter acoustic threshold (200 vs old 350): only floor when the
+        # audio is genuinely close, not just when STT happened to hear the
+        # right word despite poor pronunciation.
+        score = max(score, 25.0)
     elif not word_correct:
-        # Wrong word — cap score at 45 regardless of acoustic similarity
-        # (saying a different word that happens to sound similar shouldn't
-        # score high)
-        score = min(score, 10.0)
+        # Wrong word — cap score at 15 (tighter than old 45/10 split).
+        score = min(score, 15.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
