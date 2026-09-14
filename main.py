@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="2.9.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -240,31 +240,31 @@ def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
 def distance_to_score_ph(distance: float, dialect_code: str) -> float:
     """
     Convert DTW distance to 0-100 score matching the app's four score tiers.
-    Calibrated against real observed distances from this deployment:
-      - Observed range: ~120 (closest) to ~250+ (farthest/wrong word)
-      - Baseline acoustic gap between mic + gTTS reference is ~120 even for
-        good pronunciation — thresholds are set relative to this baseline.
+    Calibrated against real observed distances (2026-09-14 session):
+      - Observed effective range: ~58 (closest) to ~189 (farthest)
+      - Most attempts cluster between 100–155
+      - Baseline mic+gTTS acoustic gap means even good pronunciation lands ~100
 
     Tiers (after dialect tolerance adjustment):
-      100        — near-perfect acoustic match  (dist < 135)
-      50 – 99    — near: sounds close            (dist 135–175)
-      20 – 49    — far: recognisably different   (dist 175–220)
-      0  – 19    — very wrong / different word   (dist > 220)
+      100        — near-perfect acoustic match  (effective dist < 100)
+      50 – 99    — near: sounds close            (effective dist 100–140)
+      20 – 49    — far: recognisably different   (effective dist 140–175)
+      0  – 19    — very wrong / different word   (effective dist > 175)
     """
     tolerance = DIALECT_TOLERANCE.get(dialect_code, 1.0)
     d = distance / tolerance  # effective distance after dialect leniency
 
-    if d < 135:
+    if d < 100:
         return 100.0
+    elif d < 140:
+        # Near band: dist 100 → 99, dist 140 → 50
+        return float(np.clip(99.0 - (d - 100.0) / 40.0 * 49.0, 50.0, 99.0))
     elif d < 175:
-        # Near band: dist 135 → 99, dist 175 → 50
-        return float(np.clip(99.0 - (d - 135.0) / 40.0 * 49.0, 50.0, 99.0))
-    elif d < 220:
-        # Far band: dist 175 → 49, dist 220 → 20
-        return float(np.clip(49.0 - (d - 175.0) / 45.0 * 29.0, 20.0, 49.0))
+        # Far band: dist 140 → 49, dist 175 → 20
+        return float(np.clip(49.0 - (d - 140.0) / 35.0 * 29.0, 20.0, 49.0))
     else:
-        # Very wrong band: dist 220 → 19, dist 300+ → 0
-        return float(np.clip(19.0 - (d - 220.0) / 80.0 * 19.0, 0.0, 19.0))
+        # Very wrong band: dist 175 → 19, dist 250+ → 0
+        return float(np.clip(19.0 - (d - 175.0) / 75.0 * 19.0, 0.0, 19.0))
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
@@ -293,7 +293,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "2.9.0",
+        "version": "3.0.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -355,15 +355,22 @@ def score_pronunciation(body: ScoreRequest):
                 prev = temp
         return 1.0 - dp[lb] / max(la, lb)
 
-    # word_correct if: strict substring match OR phonetically very similar (≥ 0.75)
-    word_correct = strict_word_match(heard_clean, target_clean) or \
-                   levenshtein_sim(heard_clean, target_clean) >= 0.75
+    # word_correct if:
+    #   - heard_word provided AND (strict substring match OR phonetically very similar >= 0.75)
+    #   - OR heard_word is empty (STT unavailable / web fallback) -- in that case
+    #     trust the acoustic DTW score alone; we have no transcript to contradict it.
+    if not heard_clean:
+        # No STT transcript available -- acoustic score is the only signal.
+        # Treat as word_correct so the DTW result is not penalized for missing text.
+        word_correct = True
+    else:
+        word_correct = strict_word_match(heard_clean, target_clean) or \
+                       levenshtein_sim(heard_clean, target_clean) >= 0.75
 
     if word_correct and dist < 200:
         score = max(score, 25.0)
-    elif not word_correct and dist >= 175:
-        # Only cap score when both acoustically far AND wrong word
-        score = min(score, 15.0)
+    # Only cap at 15% when acoustically very far (effective dist > 175) AND
+    # wrong word -- within the near/far bands the DTW score is already honest.
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
