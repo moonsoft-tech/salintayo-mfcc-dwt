@@ -239,40 +239,32 @@ def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
 
 def distance_to_score_ph(distance: float, dialect_code: str) -> float:
     """
-    Convert DTW distance to 0-100 score matching the app's four score tiers:
+    Convert DTW distance to 0-100 score matching the app's four score tiers.
+    Calibrated against real observed distances from this deployment:
+      - Observed range: ~120 (closest) to ~250+ (farthest/wrong word)
+      - Baseline acoustic gap between mic + gTTS reference is ~120 even for
+        good pronunciation — thresholds are set relative to this baseline.
 
-      100        — acoustically very close (near-perfect, dist < 80)
-      50 – 99    — near: sounds close but not perfect   (dist 80–300)
-      20 – 49    — far: recognisably different           (dist 300–600)
-      0  – 19    — very wrong / different word           (dist > 600)
-
-    Why 100 is achievable:
-      The old cap of 50 existed because gTTS reference audio is synthetic —
-      a real speaker will never be acoustically identical to it. That's true,
-      but the cap made it impossible to score "perfect" even for excellent
-      pronunciation, which contradicts the user-facing tier system. Instead,
-      we treat dist < 80 (extremely close acoustic match) as 100%, and scale
-      linearly within each band for the rest. The floor/cap logic in the
-      route handler then adjusts based on what STT actually heard.
-
-    Dialect tolerance adjusts the effective distance — more divergent dialects
-    get more leniency since the gTTS reference is always standard Filipino.
+    Tiers (after dialect tolerance adjustment):
+      100        — near-perfect acoustic match  (dist < 135)
+      50 – 99    — near: sounds close            (dist 135–175)
+      20 – 49    — far: recognisably different   (dist 175–220)
+      0  – 19    — very wrong / different word   (dist > 220)
     """
     tolerance = DIALECT_TOLERANCE.get(dialect_code, 1.0)
     d = distance / tolerance  # effective distance after dialect leniency
 
-    if d < 80:
-        # Perfect band: very tight acoustic match → 100
+    if d < 135:
         return 100.0
-    elif d < 300:
-        # Near band: dist 80 → 99, dist 300 → 50
-        return float(np.clip(99.0 - (d - 80.0) / 220.0 * 49.0, 50.0, 99.0))
-    elif d < 600:
-        # Far band: dist 300 → 49, dist 600 → 20
-        return float(np.clip(49.0 - (d - 300.0) / 300.0 * 29.0, 20.0, 49.0))
+    elif d < 175:
+        # Near band: dist 135 → 99, dist 175 → 50
+        return float(np.clip(99.0 - (d - 135.0) / 40.0 * 49.0, 50.0, 99.0))
+    elif d < 220:
+        # Far band: dist 175 → 49, dist 220 → 20
+        return float(np.clip(49.0 - (d - 175.0) / 45.0 * 29.0, 20.0, 49.0))
     else:
-        # Very wrong band: dist 600 → 19, dist 1200+ → 0
-        return float(np.clip(19.0 - (d - 600.0) / 600.0 * 19.0, 0.0, 19.0))
+        # Very wrong band: dist 220 → 19, dist 300+ → 0
+        return float(np.clip(19.0 - (d - 220.0) / 80.0 * 19.0, 0.0, 19.0))
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
@@ -336,8 +328,6 @@ def score_pronunciation(body: ScoreRequest):
     heard_clean  = (body.heard_word or '').strip().lower()
     target_clean = (body.word or '').strip().lower()
 
-    # Strict match: exact, or one fully contains the other AND they share
-    # at least 80% of their characters — prevents "big" matching "Tubig".
     def strict_word_match(heard: str, target: str) -> bool:
         if not heard or not target:
             return False
@@ -345,20 +335,34 @@ def score_pronunciation(body: ScoreRequest):
             return True
         longer = max(len(heard), len(target))
         shorter = min(len(heard), len(target))
-        # Must be at least 80% of the longer word's length to count
-        if shorter / longer < 0.8:
+        # Must be at least 70% of the longer word's length
+        if shorter / longer < 0.70:
             return False
         return heard in target or target in heard
 
-    word_correct = strict_word_match(heard_clean, target_clean)
+    def levenshtein_sim(a: str, b: str) -> float:
+        """Simple character-level similarity 0.0–1.0."""
+        if not a or not b:
+            return 0.0
+        la, lb = len(a), len(b)
+        dp = list(range(lb + 1))
+        for i in range(1, la + 1):
+            prev = dp[0]
+            dp[0] = i
+            for j in range(1, lb + 1):
+                temp = dp[j]
+                dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
+                prev = temp
+        return 1.0 - dp[lb] / max(la, lb)
+
+    # word_correct if: strict substring match OR phonetically very similar (≥ 0.75)
+    word_correct = strict_word_match(heard_clean, target_clean) or \
+                   levenshtein_sim(heard_clean, target_clean) >= 0.75
 
     if word_correct and dist < 200:
-        # Tighter acoustic threshold (200 vs old 350): only floor when the
-        # audio is genuinely close, not just when STT happened to hear the
-        # right word despite poor pronunciation.
         score = max(score, 25.0)
-    elif not word_correct:
-        # Wrong word — cap score at 15 (tighter than old 45/10 split).
+    elif not word_correct and dist >= 175:
+        # Only cap score when both acoustically far AND wrong word
         score = min(score, 15.0)
 
     feedback = score_to_feedback_ph(score, body.word, dialect)
