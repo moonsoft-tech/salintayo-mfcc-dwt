@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 app.add_middleware(
@@ -268,23 +268,17 @@ def distance_to_score_ph(distance: float, dialect_code: str) -> float:
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
-    """Feedback messages matching the app's four score tiers."""
-    dialect_names = {
-        "fil": "Filipino", "ceb": "Cebuano", "hil": "Hiligaynon",
-        "ilo": "Ilocano", "war": "Waray", "bik": "Bikol",
-        "pam": "Kapampangan", "tsg": "Tausug", "pag": "Pangasinense",
-        "en": "English",
-    }
-    dialect_name = dialect_names.get(dialect_code, "Filipino")
-
+    """Feedback messages matching the app's five score tiers."""
     if score == 100:
-        return f"Perfect pronunciation! Excellent work on '{word}'! 🎉"
-    elif score >= 50:
-        return f"Magaling! '{word}' sounds very close — a little more practice and you'll nail it. 👍"
-    elif score >= 20:
-        return f"Getting there! Focus on matching each syllable of '{word}' and the vowel sounds: a, e, i, o, u."
+        return f"Perfect! Your pronunciation of '{word}' is spot on. Great job! 🎉"
+    elif score >= 70:
+        return f"Almost there! You're very close on '{word}' — keep practicing and you'll get it. 💪"
+    elif score >= 40:
+        return f"Not quite yet. Focus on each syllable of '{word}' and try listening to it again before your next attempt."
+    elif score >= 15:
+        return f"Keep going — pronunciation takes practice. Listen carefully to '{word}' and give it another shot."
     else:
-        return f"Subukan ulit! Listen to the reference for '{word}' carefully and try to match each syllable."
+        return f"Don't give up! Try listening to '{word}' a few more times and speak slowly, one syllable at a time."
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -293,7 +287,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -325,58 +319,18 @@ def score_pronunciation(body: ScoreRequest):
     #    Threshold tightened: word_correct requires very close string match
     #    (not just substring) AND tight acoustic distance (< 200, not 350)
     #    to prevent near-misses from getting an artificial score boost.
-    heard_clean  = (body.heard_word or '').strip().lower()
-    target_clean = (body.word or '').strip().lower()
-
-    def strict_word_match(heard: str, target: str) -> bool:
-        if not heard or not target:
-            return False
-        if heard == target:
-            return True
-        longer = max(len(heard), len(target))
-        shorter = min(len(heard), len(target))
-        # Must be at least 70% of the longer word's length
-        if shorter / longer < 0.70:
-            return False
-        return heard in target or target in heard
-
-    def levenshtein_sim(a: str, b: str) -> float:
-        """Simple character-level similarity 0.0–1.0."""
-        if not a or not b:
-            return 0.0
-        la, lb = len(a), len(b)
-        dp = list(range(lb + 1))
-        for i in range(1, la + 1):
-            prev = dp[0]
-            dp[0] = i
-            for j in range(1, lb + 1):
-                temp = dp[j]
-                dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
-                prev = temp
-        return 1.0 - dp[lb] / max(la, lb)
-
-    # word_correct if:
-    #   - heard_word provided AND (strict substring match OR phonetically very similar >= 0.75)
-    #   - OR heard_word is empty (STT unavailable / web fallback) -- in that case
-    #     trust the acoustic DTW score alone; we have no transcript to contradict it.
-    if not heard_clean:
-        # No STT transcript available -- acoustic score is the only signal.
-        # Treat as word_correct so the DTW result is not penalized for missing text.
-        word_correct = True
-    else:
-        word_correct = strict_word_match(heard_clean, target_clean) or \
-                       levenshtein_sim(heard_clean, target_clean) >= 0.75
-
-    if word_correct and dist < 200:
-        score = max(score, 25.0)
-    # Only cap at 15% when acoustically very far (effective dist > 175) AND
-    # wrong word -- within the near/far bands the DTW score is already honest.
-
+    # Score comes purely from acoustic DTW distance — no word_correct
+    # floor or cap. The DTW bands already encode the full tier system:
+    # a wrong word acoustically far from the reference scores low naturally,
+    # and a close pronunciation scores high regardless of what STT heard.
+    # Adding a text-based cap on top of acoustic scoring punishes users
+    # when Whisper mishears (e.g. "Magkanu" → heard as "Magkano" or something
+    # else) even though their audio was genuinely close.
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
 
-    logger.info("RAW dist=%.4f effective=%.4f score=%.1f word_correct=%s",
-                dist, dist / DIALECT_TOLERANCE.get(dialect, 1.0), score, word_correct)
+    logger.info("RAW dist=%.4f effective=%.4f score=%.1f",
+                dist, dist / DIALECT_TOLERANCE.get(dialect, 1.0), score)
 
     return ScoreResponse(
         score=round(score, 1),
