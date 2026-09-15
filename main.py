@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.1.0",
+    version="3.2.0",
 )
 
 app.add_middleware(
@@ -237,34 +237,55 @@ def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
     return float(distance / avg_len) if avg_len > 0 else float(distance)
 
 
-def distance_to_score_ph(distance: float, dialect_code: str) -> float:
+def distance_to_score_ph(distance: float, dialect_code: str, word: str = '') -> float:
     """
-    Convert DTW distance to 0-100 score matching the app's four score tiers.
+    Convert DTW distance to 0-100 score matching the app's five score tiers.
     Calibrated against real observed distances (2026-09-14 session):
-      - Observed effective range: ~58 (closest) to ~189 (farthest)
-      - Most attempts cluster between 100–155
-      - Baseline mic+gTTS acoustic gap means even good pronunciation lands ~100
+      - Single words: effective range ~58 (best) to ~189 (worst)
+      - Multi-word phrases need stricter thresholds — more syllables means
+        more chance for a wrong phrase to coincidentally align with parts of
+        the target, inflating the score unfairly.
 
-    Tiers (after dialect tolerance adjustment):
-      100        — near-perfect acoustic match  (effective dist < 100)
-      50 – 99    — near: sounds close            (effective dist 100–140)
-      20 – 49    — far: recognisably different   (effective dist 140–175)
-      0  – 19    — very wrong / different word   (effective dist > 175)
+    Thresholds tighten proportionally with word count so a completely wrong
+    3-word phrase can't score 88-90% by accidentally matching stray syllables.
+
+    Tiers (after dialect tolerance + word-count adjustment):
+      100        — near-perfect acoustic match
+      70 – 99    — almost there, very close
+      40 – 69    — still far, needs more practice
+      15 – 39    — quite bad
+      0  – 14    — very bad
     """
     tolerance = DIALECT_TOLERANCE.get(dialect_code, 1.0)
     d = distance / tolerance  # effective distance after dialect leniency
 
-    if d < 100:
+    # Word-count tightening: each additional word beyond the first reduces
+    # thresholds by 12%, so a 3-word phrase is ~24% stricter than a single word.
+    # This prevents wrong multi-word phrases from scoring high via coincidental
+    # syllable alignment. Single words (count=1) get no adjustment (factor=1.0).
+    word_count = max(1, len((word or '').strip().split()))
+    tightening = 1.0 - (word_count - 1) * 0.12  # 1 word→1.0, 2→0.88, 3→0.76, 4→0.64
+    tightening = max(0.55, tightening)           # floor at 0.55 for very long phrases
+
+    perfect   = 100  * tightening   # single: 100,  2-word: 88,  3-word: 76
+    near_end  = 140  * tightening   # single: 140,  2-word: 123, 3-word: 106
+    far_end   = 175  * tightening   # single: 175,  2-word: 154, 3-word: 133
+    wrong_end = 250  * tightening   # single: 250,  2-word: 220, 3-word: 190
+
+    if d < perfect:
         return 100.0
-    elif d < 140:
-        # Near band: dist 100 → 99, dist 140 → 50
-        return float(np.clip(99.0 - (d - 100.0) / 40.0 * 49.0, 50.0, 99.0))
-    elif d < 175:
-        # Far band: dist 140 → 49, dist 175 → 20
-        return float(np.clip(49.0 - (d - 140.0) / 35.0 * 29.0, 20.0, 49.0))
+    elif d < near_end:
+        # Near band: perfect → 99, near_end → 70
+        return float(np.clip(99.0 - (d - perfect) / (near_end - perfect) * 29.0, 70.0, 99.0))
+    elif d < far_end:
+        # Far band: near_end → 69, far_end → 40
+        return float(np.clip(69.0 - (d - near_end) / (far_end - near_end) * 29.0, 40.0, 69.0))
+    elif d < wrong_end:
+        # Bad band: far_end → 39, wrong_end → 15
+        return float(np.clip(39.0 - (d - far_end) / (wrong_end - far_end) * 24.0, 15.0, 39.0))
     else:
-        # Very wrong band: dist 175 → 19, dist 250+ → 0
-        return float(np.clip(19.0 - (d - 175.0) / 75.0 * 19.0, 0.0, 19.0))
+        # Very bad band: wrong_end → 14, tails to 0
+        return float(np.clip(14.0 - (d - wrong_end) / 100.0 * 14.0, 0.0, 14.0))
 
 
 def score_to_feedback_ph(score: float, word: str, dialect_code: str) -> str:
@@ -287,7 +308,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -311,7 +332,7 @@ def score_pronunciation(body: ScoreRequest):
     logger.info("DTW distance (normalized): %.4f", dist)
 
     # 4. Dialect-aware score
-    score = distance_to_score_ph(dist, dialect)
+    score = distance_to_score_ph(dist, dialect, body.word)
 
     # 5. Smart floor — only boost score when STT confirmed the right word
     #    was heard AND the acoustic distance is tight.
@@ -329,8 +350,8 @@ def score_pronunciation(body: ScoreRequest):
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
 
-    logger.info("RAW dist=%.4f effective=%.4f score=%.1f",
-                dist, dist / DIALECT_TOLERANCE.get(dialect, 1.0), score)
+    logger.info("RAW dist=%.4f effective=%.4f words=%d score=%.1f",
+                dist, dist / DIALECT_TOLERANCE.get(dialect, 1.0), len((body.word or '').strip().split()), score)
 
     return ScoreResponse(
         score=round(score, 1),
