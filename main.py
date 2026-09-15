@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.6.0",
+    version="3.7.0",
 )
 
 app.add_middleware(
@@ -227,12 +227,7 @@ def extract_mfcc_ph(y: np.ndarray) -> np.ndarray:
 def has_sufficient_speech(y: np.ndarray, threshold_db: float = -35.0) -> bool:
     """
     Returns True only when the audio contains enough energy to be real speech.
-    Rejects silence, breathing, and background noise that would otherwise
-    score coincidentally against the reference.
-
-    threshold_db: minimum RMS energy in dB. -35 dB is a conservative threshold
-    that passes normal speech but rejects silence/breath/ambient noise.
-    Typical speech: -20 to -10 dB. Silence/breath: -50 to -40 dB.
+    Rejects silence, breathing, and background noise.
     """
     if len(y) == 0:
         return False
@@ -242,6 +237,29 @@ def has_sufficient_speech(y: np.ndarray, threshold_db: float = -35.0) -> bool:
     rms_db = 20 * np.log10(rms)
     logger.info("Audio RMS: %.1f dB (threshold: %.1f dB)", rms_db, threshold_db)
     return rms_db >= threshold_db
+
+
+def duration_penalty(y_learner: np.ndarray, y_reference: np.ndarray) -> float:
+    """
+    Returns a penalty multiplier (0.0–1.0) based on duration ratio.
+    Catches held vowels ("ahhh" vs "Ama") and very short recordings.
+    """
+    dur_learner   = len(y_learner)  / SAMPLE_RATE
+    dur_reference = len(y_reference) / SAMPLE_RATE
+
+    if dur_reference < 0.05:
+        return 1.0
+
+    ratio = dur_learner / dur_reference
+
+    if 0.5 <= ratio <= 2.0:
+        return 1.0
+    elif ratio > 2.0:
+        penalty = max(0.4, 1.0 - (ratio - 2.0) * 0.3)
+        return penalty
+    else:
+        penalty = max(0.5, ratio / 0.5)
+        return penalty
     """
     Returns a penalty multiplier (0.0–1.0) based on how well the learner's
     audio duration matches the reference. A held vowel ("ahhhhh") against a
@@ -354,7 +372,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
