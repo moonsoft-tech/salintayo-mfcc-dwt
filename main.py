@@ -244,17 +244,16 @@ def duration_penalty(y_learner: np.ndarray, y_reference: np.ndarray) -> float:
     ratio = dur_learner / dur_reference
 
     if 0.5 <= ratio <= 2.0:
-        # Within reasonable range — no penalty
         return 1.0
     elif ratio > 2.0:
-        # Learner held too long (e.g. "ahhhh" vs "Ama")
-        # ratio 2.0→1.0, ratio 3.0→0.6, ratio 4.0+→0.4
         penalty = max(0.4, 1.0 - (ratio - 2.0) * 0.3)
         return penalty
     else:
-        # Learner too short (ratio < 0.5)
         penalty = max(0.5, ratio / 0.5)
         return penalty
+
+
+def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
     """
     DTW distance normalized for Philippine word length distribution.
     Most Filipino words are 1-3 syllables (2-6 phonemes).
