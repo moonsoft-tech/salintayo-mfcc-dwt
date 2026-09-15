@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.5.0",
+    version="3.6.0",
 )
 
 app.add_middleware(
@@ -224,7 +224,24 @@ def extract_mfcc_ph(y: np.ndarray) -> np.ndarray:
     return np.vstack([mfcc, rms_norm, delta])
 
 
-def duration_penalty(y_learner: np.ndarray, y_reference: np.ndarray) -> float:
+def has_sufficient_speech(y: np.ndarray, threshold_db: float = -35.0) -> bool:
+    """
+    Returns True only when the audio contains enough energy to be real speech.
+    Rejects silence, breathing, and background noise that would otherwise
+    score coincidentally against the reference.
+
+    threshold_db: minimum RMS energy in dB. -35 dB is a conservative threshold
+    that passes normal speech but rejects silence/breath/ambient noise.
+    Typical speech: -20 to -10 dB. Silence/breath: -50 to -40 dB.
+    """
+    if len(y) == 0:
+        return False
+    rms = np.sqrt(np.mean(y ** 2))
+    if rms == 0:
+        return False
+    rms_db = 20 * np.log10(rms)
+    logger.info("Audio RMS: %.1f dB (threshold: %.1f dB)", rms_db, threshold_db)
+    return rms_db >= threshold_db
     """
     Returns a penalty multiplier (0.0–1.0) based on how well the learner's
     audio duration matches the reference. A held vowel ("ahhhhh") against a
@@ -337,7 +354,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -351,6 +368,16 @@ def score_pronunciation(body: ScoreRequest):
     # 1. Decode + preprocess
     y_learner   = preprocess_audio(decode_audio(body.audio_base64))
     y_reference = preprocess_audio(decode_audio(body.reference_base64))
+
+    # 1b. Silence/noise guard — reject audio with insufficient speech energy.
+    #     Prevents background noise, breathing, or an empty recording from
+    #     scoring coincidentally against the reference.
+    if not has_sufficient_speech(y_learner):
+        logger.info("Audio rejected: insufficient speech energy (silence or noise)")
+        raise HTTPException(
+            status_code=422,
+            detail="No speech detected. Please speak clearly into the microphone and try again."
+        )
 
     # 2. Extract Philippine-tuned MFCCs
     mfcc_learner   = extract_mfcc_ph(y_learner)
