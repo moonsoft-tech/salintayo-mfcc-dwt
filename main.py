@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.3.0",
+    version="3.5.0",
 )
 
 app.add_middleware(
@@ -297,9 +297,9 @@ def distance_to_score_ph(distance: float, dialect_code: str, word: str = '') -> 
     tightening = max(0.55, tightening)           # floor at 0.55 for very long phrases
 
     perfect   = 100  * tightening   # single: 100,  2-word: 88,  3-word: 76
-    near_end  = 140  * tightening   # single: 140,  2-word: 123, 3-word: 106
-    far_end   = 175  * tightening   # single: 175,  2-word: 154, 3-word: 133
-    wrong_end = 250  * tightening   # single: 250,  2-word: 220, 3-word: 190
+    near_end  = 135  * tightening   # single: 135,  2-word: 119, 3-word: 103
+    far_end   = 160  * tightening   # single: 160,  2-word: 141, 3-word: 122
+    wrong_end = 182  * tightening   # single: 182,  2-word: 160, 3-word: 138
 
     if d < perfect:
         return 100.0
@@ -337,7 +337,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.3.0",
+        "version": "3.5.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -372,22 +372,8 @@ def score_pronunciation(body: ScoreRequest):
                     d_penalty)
     score = score * d_penalty
 
-    # 5. Smart floor — only boost score when STT confirmed the right word
-    #    was heard AND the acoustic distance is tight.
-    #    Wrong word said = no floor = honest low acoustic score.
-    #    Threshold tightened: word_correct requires very close string match
-    #    (not just substring) AND tight acoustic distance (< 200, not 350)
-    #    to prevent near-misses from getting an artificial score boost.
-    # Score comes purely from acoustic DTW distance — no word_correct
-    # floor or cap. The DTW bands already encode the full tier system:
-    # a wrong word acoustically far from the reference scores low naturally,
-    # and a close pronunciation scores high regardless of what STT heard.
-    # Adding a text-based cap on top of acoustic scoring punishes users
-    # when Whisper mishears (e.g. "Magkanu" → heard as "Magkano" or something
-    # else) even though their audio was genuinely close.
     feedback = score_to_feedback_ph(score, body.word, dialect)
     logger.info("Score: %.1f — %s", score, feedback)
-
     logger.info("RAW dist=%.4f effective=%.4f words=%d score=%.1f",
                 dist, dist / DIALECT_TOLERANCE.get(dialect, 1.0), len((body.word or '').strip().split()), score)
 
