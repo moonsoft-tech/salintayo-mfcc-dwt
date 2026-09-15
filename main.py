@@ -39,7 +39,7 @@ logger = logging.getLogger("salintayo-scorer")
 app = FastAPI(
     title="SalinTayo Pronunciation Scorer",
     description="MFCC + DTW scoring tuned for Philippine dialect phonology.",
-    version="3.2.0",
+    version="3.3.0",
 )
 
 app.add_middleware(
@@ -224,7 +224,37 @@ def extract_mfcc_ph(y: np.ndarray) -> np.ndarray:
     return np.vstack([mfcc, rms_norm, delta])
 
 
-def dtw_distance_ph(mfcc_a: np.ndarray, mfcc_b: np.ndarray) -> float:
+def duration_penalty(y_learner: np.ndarray, y_reference: np.ndarray) -> float:
+    """
+    Returns a penalty multiplier (0.0–1.0) based on how well the learner's
+    audio duration matches the reference. A held vowel ("ahhhhh") against a
+    short word ("Ama") should score low even if the vowel formant matches.
+
+    Ratio = learner_duration / reference_duration
+      - Close to 1.0 → no penalty (multiplier = 1.0)
+      - Very short or very long → penalty applied
+      - Ratio > 3.0 (held much longer) or < 0.3 (way too short) → strong penalty
+    """
+    dur_learner   = len(y_learner)  / SAMPLE_RATE
+    dur_reference = len(y_reference) / SAMPLE_RATE
+
+    if dur_reference < 0.05:
+        return 1.0  # can't judge — reference too short
+
+    ratio = dur_learner / dur_reference
+
+    if 0.5 <= ratio <= 2.0:
+        # Within reasonable range — no penalty
+        return 1.0
+    elif ratio > 2.0:
+        # Learner held too long (e.g. "ahhhh" vs "Ama")
+        # ratio 2.0→1.0, ratio 3.0→0.6, ratio 4.0+→0.4
+        penalty = max(0.4, 1.0 - (ratio - 2.0) * 0.3)
+        return penalty
+    else:
+        # Learner too short (ratio < 0.5)
+        penalty = max(0.5, ratio / 0.5)
+        return penalty
     """
     DTW distance normalized for Philippine word length distribution.
     Most Filipino words are 1-3 syllables (2-6 phonemes).
@@ -308,7 +338,7 @@ def root():
     return {
         "service": "SalinTayo Pronunciation Scorer",
         "status": "ok",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "dialect_support": list(GTTS_LANG_MAP.keys()),
         "endpoints": ["/score/pronunciation", "/reference/generate"],
     }
@@ -331,8 +361,17 @@ def score_pronunciation(body: ScoreRequest):
     dist = dtw_distance_ph(mfcc_learner, mfcc_reference)
     logger.info("DTW distance (normalized): %.4f", dist)
 
-    # 4. Dialect-aware score
+    # 4. Dialect-aware score with word-count tightening
     score = distance_to_score_ph(dist, dialect, body.word)
+
+    # 5. Duration penalty — catches held vowels / silent gaps scored against
+    #    short words (e.g. "ahhh" vs "Ama" should not score 100%).
+    d_penalty = duration_penalty(y_learner, y_reference)
+    if d_penalty < 1.0:
+        logger.info("Duration penalty applied: ratio=%.2f penalty=%.2f",
+                    (len(y_learner) / SAMPLE_RATE) / max(0.05, len(y_reference) / SAMPLE_RATE),
+                    d_penalty)
+    score = score * d_penalty
 
     # 5. Smart floor — only boost score when STT confirmed the right word
     #    was heard AND the acoustic distance is tight.
